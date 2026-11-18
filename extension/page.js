@@ -93,8 +93,17 @@
   }
 
   // ---- artwork ----------------------------------------------------------------
-  function youtubeId() {
-    if (!/(^|\.)youtube\.com$/.test(location.hostname) || location.hostname.startsWith("music.")) return null;
+  const onYouTube = /(^|\.)youtube\.com$/.test(location.hostname) && !location.hostname.startsWith("music.");
+
+  // On YouTube, prefer the video ID in the page's own artwork URLs: YouTube can
+  // set the new video's metadata before the address bar changes, so the URL
+  // may still point at the previous video.
+  function youtubeId(meta) {
+    if (!onYouTube) return null;
+    for (const a of meta?.artwork || []) {
+      const m = /ytimg\.com\/vi(?:_webp)?\/([\w-]{6,})\//.exec(a?.src || "");
+      if (m) return m[1];
+    }
     const v = new URLSearchParams(location.search).get("v");
     if (v) return v;
     const m = location.pathname.match(/^\/(?:shorts|live|embed)\/([\w-]{6,})/);
@@ -108,14 +117,17 @@
 
   function artworkCandidates(meta) {
     const urls = [];
-    const id = youtubeId();
+    const id = youtubeId(meta);
     if (id) urls.push(`https://i.ytimg.com/vi/${id}/maxresdefault.jpg`, `https://i.ytimg.com/vi/${id}/hqdefault.jpg`);
     const art = meta?.artwork ? [...meta.artwork] : [];
     art.sort((a, b) => areaOf(b.sizes) - areaOf(a.sizes));
     for (const a of art) if (a?.src) urls.push(new URL(a.src, location.href).href);
-    const og = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]')?.content;
-    if (og) urls.push(new URL(og, location.href).href);
-    if (activeMedia?.poster) urls.push(new URL(activeMedia.poster, location.href).href);
+    // og:image and posters go stale on single-page sites like YouTube.
+    if (!id && !art.length) {
+      const og = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]')?.content;
+      if (og) urls.push(new URL(og, location.href).href);
+      if (activeMedia?.poster) urls.push(new URL(activeMedia.poster, location.href).href);
+    }
     return [...new Set(urls)].filter((u) => /^https?:/.test(u));
   }
 
@@ -129,17 +141,42 @@
         clearTimeout(timer);
         resolve(e.data.dataURL);
       };
-      const timer = setTimeout(() => { window.removeEventListener("message", onReply); resolve(null); }, 10000);
+      const timer = setTimeout(() => { window.removeEventListener("message", onReply); resolve(null); }, 20000);
       window.addEventListener("message", onReply);
       window.postMessage({ __npe: "artwork-request", id, urls }, "*");
     });
   }
 
   // ---- merge it all into the metadata Firefox publishes ----------------------
+  const failures = new Map(); // artKey -> { count, retryAt }
   let enhanceTimer = 0;
   function queueEnhance() {
     clearTimeout(enhanceTimer);
     enhanceTimer = setTimeout(enhance, 150);
+  }
+
+  function fetchArtwork(artKey, candidates) {
+    const f = failures.get(artKey);
+    if (inflight.has(artKey) || (f && Date.now() < f.retryAt)) return;
+    inflight.add(artKey);
+    requestArtwork(candidates).then((dataURL) => {
+      inflight.delete(artKey);
+      if (dataURL) {
+        failures.delete(artKey);
+        artCache.set(artKey, dataURL);
+        if (artCache.size > 30) artCache.delete(artCache.keys().next().value);
+      } else {
+        // Retry later (2s, 4s, 8s ... up to 60s) instead of giving up for good.
+        const count = (f?.count || 0) + 1;
+        failures.set(artKey, { count, retryAt: Date.now() + Math.min(60000, 1000 * 2 ** count) });
+        console.debug("[Now Playing Enhancer] artwork fetch failed, will retry:", candidates);
+      }
+      queueEnhance();
+    });
+  }
+
+  function currentArtKey() {
+    return artworkCandidates(pageMeta).join("|");
   }
 
   function enhance() {
@@ -150,21 +187,13 @@
     const album = base?.album || "";
     const candidates = artworkCandidates(base);
     const artKey = candidates.join("|");
+    const dataURL = artCache.get(artKey);
 
-    if (artKey && !artCache.has(artKey)) {
-      if (!inflight.has(artKey)) {
-        inflight.add(artKey);
-        requestArtwork(candidates).then((dataURL) => {
-          inflight.delete(artKey);
-          artCache.set(artKey, dataURL);
-          if (artCache.size > 30) artCache.delete(artCache.keys().next().value);
-          queueEnhance();
-        });
-      }
-      if (base) return; // page metadata is already live; wait for artwork
+    if (artKey && !dataURL) {
+      fetchArtwork(artKey, candidates);
+      if (base && !appliedKey) return; // page metadata is already live; wait for artwork
     }
 
-    const dataURL = artCache.get(artKey);
     const key = [title, artist, album, artKey, !!dataURL].join("\u0000");
     if (key === appliedKey) return;
 
@@ -180,11 +209,23 @@
     syncPosition();
   }
 
-  // Sites that never set metadata: refresh when the tab title changes.
-  let lastTitle = "";
+  // YouTube fires this after switching videos without a page load.
+  window.addEventListener("yt-navigate-finish", queueEnhance);
+  window.addEventListener("popstate", queueEnhance);
+
+  // Self-heal every 2s while something is playing: catch address/title
+  // changes, retry failed artwork, and re-apply artwork if it was overwritten.
+  let lastHref = location.href;
+  let lastTitle = document.title;
   setInterval(() => {
-    if (pageMeta || !activeMedia || activeMedia.paused || document.title === lastTitle) return;
-    lastTitle = document.title;
-    queueEnhance();
+    if (!activeMedia || activeMedia.paused) return;
+    let stale = false;
+    if (location.href !== lastHref) { lastHref = location.href; stale = true; }
+    if (!pageMeta && document.title !== lastTitle) { lastTitle = document.title; stale = true; }
+    const artKey = currentArtKey();
+    const wanted = artCache.get(artKey);
+    const shown = nativeGet.call(ms)?.artwork?.[0]?.src;
+    if (artKey && (!wanted || shown !== wanted)) stale = true;
+    if (stale) { appliedKey = ""; queueEnhance(); }
   }, 2000);
 })();
